@@ -90,7 +90,10 @@ impl<'a> Iterator for PollEventsIterator<'a> {
                     location: (motion.x as f64, motion.y as f64),
                     id: motion.pointer_id as u64,
                 }))
-            }
+            },
+            Ok(android_glue::Event::Wake) => {
+                Some(Event::Awakened)
+            },
             _ => {
                 None
             }
@@ -299,7 +302,7 @@ pub struct WindowProxy;
 impl WindowProxy {
     #[inline]
     pub fn wakeup_event_loop(&self) {
-        unimplemented!()
+        android_glue::wake_event_loop();
     }
 }
 
