@@ -19,11 +19,48 @@ use WindowAttributes;
 use api::egl;
 use api::egl::Context as EglContext;
 
+use std::cell::Cell;
+
 mod ffi;
+
+pub struct WaitEventsIterator<'a> {
+    window: &'a Window,
+    winit_iterator: winit::WaitEventsIterator<'a>,
+}
+
+impl<'a> Iterator for WaitEventsIterator<'a> {
+    type Item = winit::Event;
+
+    fn next(&mut self) -> Option<winit::Event> {
+        let event = self.winit_iterator.next();
+        if let Some(event) = event {
+            return self.window.handle_event(event);
+        }
+        None
+    }
+}
+
+pub struct PollEventsIterator<'a> {
+    window: &'a Window,
+    winit_iterator: winit::PollEventsIterator<'a>,
+}
+
+impl<'a> Iterator for PollEventsIterator<'a> {
+    type Item = winit::Event;
+
+    fn next(&mut self) -> Option<winit::Event> {
+        let event = self.winit_iterator.next();
+        if let Some(event) = event {
+            return self.window.handle_event(event);
+        }
+        None
+    }
+}
 
 pub struct Window {
     context: EglContext,
     winit_window: winit::Window,
+    stopped: Cell<bool>
 }
 
 #[derive(Clone, Default)]
@@ -53,7 +90,54 @@ impl Window {
         Ok(Window {
             context: context,
             winit_window: winit_window,
+            stopped: Cell::new(false)
         })
+    }
+
+    pub fn handle_event(&self, event: winit::Event) -> Option<winit::Event> {
+        match event {
+            winit::Event::Suspended(suspended) => {
+                if suspended {
+                    self.on_surface_destroyed();
+                } else {
+                    self.on_surface_created();
+                }
+            }
+            _ => {}
+        };
+
+        Some(event)
+    }
+
+    // Android has started the activity or sent it to foreground.
+    // Restore the EGL surface and animation loop.
+    fn on_surface_created(&self) {
+        if self.stopped.get() {
+           self.stopped.set(false);
+           unsafe {
+               let native_window = android_glue::get_native_window();
+               self.context.on_surface_created(native_window as *const _);
+           }
+
+           // We stopped the renderloop when on_surface_destroyed was called.
+           // We need to wakeup the event loop again.
+           android_glue::wake_event_loop();
+        }
+    }
+
+    // Android has stopped the activity or sent it to background.
+    // Release the EGL surface and stop the animation loop.
+    fn on_surface_destroyed(&self) {
+        if !self.stopped.get() {
+            self.stopped.set(true);
+            unsafe {
+                self.context.on_surface_destroyed();
+            }
+        }
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.get()
     }
 
     pub fn set_title(&self, title: &str) {
@@ -99,12 +183,18 @@ impl Window {
         self.winit_window.set_inner_size(x, y)
     }
 
-    pub fn poll_events(&self) -> winit::PollEventsIterator {
-        self.winit_window.poll_events()
+    pub fn poll_events(&self) -> PollEventsIterator {
+        PollEventsIterator {
+            window: self,
+            winit_iterator: self.winit_window.poll_events()
+        }
     }
 
-    pub fn wait_events(&self) -> winit::WaitEventsIterator {
-        self.winit_window.wait_events()
+    pub fn wait_events(&self) -> WaitEventsIterator {
+        WaitEventsIterator {
+            window: self,
+            winit_iterator: self.winit_window.wait_events()
+        }
     }
 
     pub unsafe fn platform_display(&self) -> *mut libc::c_void {
@@ -156,11 +246,17 @@ unsafe impl Sync for Window {}
 impl GlContext for Window {
     #[inline]
     unsafe fn make_current(&self) -> Result<(), ContextError> {
-        self.context.make_current()
+        if !self.stopped.get() {
+            return self.context.make_current();
+        }
+        Err(ContextError::ContextLost)
     }
 
     #[inline]
     fn is_current(&self) -> bool {
+        if self.stopped.get() {
+            return false;
+        }
         self.context.is_current()
     }
 
@@ -171,7 +267,10 @@ impl GlContext for Window {
 
     #[inline]
     fn swap_buffers(&self) -> Result<(), ContextError> {
-        self.context.swap_buffers()
+        if !self.stopped.get() {
+            return self.context.swap_buffers();
+        }
+        Err(ContextError::ContextLost)
     }
 
     #[inline]
@@ -191,7 +290,7 @@ pub struct WindowProxy;
 impl WindowProxy {
     #[inline]
     pub fn wakeup_event_loop(&self) {
-        unimplemented!()
+        android_glue::wake_event_loop();
     }
 }
 
