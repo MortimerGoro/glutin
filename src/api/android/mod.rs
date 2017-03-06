@@ -17,10 +17,94 @@ use PixelFormatRequirements;
 use api::egl;
 use api::egl::Context as EglContext;
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::sync::{Arc, Weak};
+use {Event, WindowEvent};
+
 mod ffi;
 
 pub struct Context {
     egl_context: EglContext,
+    stopped: Cell<bool>,
+}
+
+pub struct EventsLoop {
+    winit_events_loop: winit::EventsLoop,
+    contexts: RefCell<HashMap<winit::WindowId, Weak<Context>>>,
+}
+
+impl EventsLoop {
+    /// Builds a new events loop.
+    pub fn new() -> EventsLoop {
+        EventsLoop {
+            winit_events_loop: winit::EventsLoop::new(),
+            contexts: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn handle_suspended(&self, window_id: winit::WindowId, suspended: bool) {
+        if let Some(context) = self.contexts.borrow()[&window_id].upgrade() {
+            if context.stopped.get() == suspended {
+                return;
+            }
+            context.stopped.set(suspended);
+            if suspended {
+                // Android has stopped the activity or sent it to background.
+                // Release the EGL surface and stop the animation loop.
+                unsafe {
+                    context.egl_context.on_surface_destroyed();
+                }
+            } else {
+                // Android has started the activity or sent it to foreground.
+                // Restore the EGL surface and animation loop.
+                unsafe {
+                    let native_window = android_glue::get_native_window();
+                    context.egl_context.on_surface_created(native_window as *const _);
+                }
+            }
+        }
+    }
+
+    fn insert_window(&self,
+                     window_id: winit::WindowId,
+                     context: &Arc<Context>)
+    {
+        self.contexts.borrow_mut().insert(window_id, Arc::downgrade(context));
+    }
+
+    /// Fetches all the events that are pending, calls the callback function for each of them,
+    /// and returns.
+    #[inline]
+    pub fn poll_events<F>(&self, mut callback: F)
+        where F: FnMut(Event)
+    {
+        self.winit_events_loop.poll_events(|event| {
+            if let Event::WindowEvent { window_id, event: WindowEvent::Suspended(suspended) } = event {
+                self.handle_suspended(window_id, suspended)
+            }
+            callback(event);
+        })
+    }
+
+    /// Runs forever until `interrupt()` is called. Whenever an event happens, calls the callback.
+    #[inline]
+    pub fn run_forever<F>(&self, mut callback: F)
+        where F: FnMut(Event)
+    {
+        self.winit_events_loop.run_forever(|event| {
+            if let Event::WindowEvent { window_id, event: WindowEvent::Suspended(suspended) } = event {
+                self.handle_suspended(window_id, suspended)
+            }
+            callback(event);
+        })
+    }
+
+    /// If we called `run_forever()`, stops the process of waiting for events.
+    #[inline]
+    pub fn interrupt(&self) {
+        self.winit_events_loop.interrupt()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -44,7 +128,7 @@ impl Context {
         let native_display = egl::NativeDisplay::Android;
         let context = try!(EglContext::new(egl, pf_reqs, &gl_attr, native_display)
             .and_then(|p| p.finish(native_window as *const _)));
-        let context = Context { egl_context: context };
+        let context = Context { egl_context: context, stopped: Cell::new(false) };
         Ok((window, context))
     }
 
